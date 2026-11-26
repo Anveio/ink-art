@@ -23,6 +23,8 @@ export const PAPERS = {
   sketchbook: { name: 'sketchbook', tooth: 0.14, contrast: 0.85, fibers: 0.25, relief: 0.012, cockle: 0.25, tint: [0.88, 0.86, 0.81] },
   /** Smooth bristol: crisp lines, glossy darks. For the studio-quality panels. */
   bristol: { name: 'bristol', tooth: 0.1, contrast: 0.5, fibers: 0.1, relief: 0.006, cockle: 0.1, tint: [0.9, 0.89, 0.86] },
+  /** Hot-pressed drawing paper: smooth enough for studio rendering, enough tooth to read as paper up close. */
+  hotpress: { name: 'hotpress', tooth: 0.11, contrast: 0.72, fibers: 0.16, relief: 0.009, cockle: 0.15, tint: [0.895, 0.88, 0.84] },
   /** Toothy drawing paper: grainy, dramatic texture. */
   coldpress: { name: 'coldpress', tooth: 0.3, contrast: 1, fibers: 0.35, relief: 0.022, cockle: 0.35, tint: [0.87, 0.85, 0.79] },
 } satisfies Record<string, Paper>;

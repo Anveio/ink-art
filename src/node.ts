@@ -18,12 +18,39 @@ export function encodePng(img: RenderedImage, dpi?: number): Buffer {
 }
 
 /** Render and write a PNG. Returns a one-line summary that is cheap to read. */
-export function renderToFile(page: Page, file: string, opts: RenderOpts = {}): string {
-  const img = render(page, opts);
+export function renderToFile(page: Page, file: string, opts: RenderOpts & { supersample?: number } = {}): string {
+  const ss = Math.max(1, Math.round(opts.supersample ?? 1));
+  let img = ss > 1 ? render(page, { ...opts, dpi: (opts.dpi ?? 100) * ss, fit: opts.fit ? opts.fit * ss : undefined }) : render(page, opts);
+  if (ss > 1) img = downsample(img, ss);
   mkdirSync(dirname(file), { recursive: true });
   const dpi = opts.fit ? undefined : opts.dpi ?? 100;
   writeFileSync(file, encodePng(img, dpi));
   return `${file} ${img.width}x${img.height}px ${img.stats.ops} ops ${img.stats.ms}ms`;
+}
+
+/**
+ * Box-filter an image down by an integer factor. Hatching finer than the output pixels averages
+ * into tone instead of aliasing into moire, like a scan at lower resolution would.
+ */
+export function downsample(img: RenderedImage, k: number): RenderedImage {
+  const W = Math.floor(img.width / k), H = Math.floor(img.height / k);
+  const out = new Uint8ClampedArray(W * H * 4);
+  // Average in linear light.
+  const lin = new Float32Array(256);
+  for (let i = 0; i < 256; i++) { const c = i / 255; lin[i] = c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }
+  const toS = (v: number) => Math.round(255 * (v <= 0.0031308 ? 12.92 * v : 1.055 * v ** (1 / 2.4) - 0.055));
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++) {
+      let r = 0, g = 0, b = 0;
+      for (let j = 0; j < k; j++)
+        for (let i = 0; i < k; i++) {
+          const o = ((y * k + j) * img.width + x * k + i) * 4;
+          r += lin[img.data[o]]; g += lin[img.data[o + 1]]; b += lin[img.data[o + 2]];
+        }
+      const n = k * k, o = (y * W + x) * 4;
+      out[o] = toS(r / n); out[o + 1] = toS(g / n); out[o + 2] = toS(b / n); out[o + 3] = 255;
+    }
+  return { ...img, width: W, height: H, data: out, pxPerMm: img.pxPerMm / k };
 }
 
 /** Insert a pHYs chunk so print tools see the intended DPI. */
@@ -97,4 +124,19 @@ export function writeImage(img: RenderedImage, file: string): string {
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, encodePng(img));
   return `${file} ${img.width}x${img.height}px`;
+}
+
+/** Write a Grid (e.g. a tonal target or an SDF luminance map) as a greyscale PNG for checking. */
+export function writeGridPng(g: { w: number; h: number; data: Float32Array }, file: string, opts: { scale?: number; gamma?: number; invert?: boolean } = {}) {
+  const png = new PNG({ width: g.w, height: g.h });
+  const k = opts.scale ?? 1, gam = opts.gamma ?? 2.2;
+  for (let i = 0; i < g.w * g.h; i++) {
+    let v = Math.max(0, Math.min(1, g.data[i] * k));
+    if (opts.invert) v = 1 - v;
+    const s = Math.round(255 * Math.pow(v, 1 / gam));
+    png.data[i * 4] = png.data[i * 4 + 1] = png.data[i * 4 + 2] = s;
+    png.data[i * 4 + 3] = 255;
+  }
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, PNG.sync.write(png));
 }
