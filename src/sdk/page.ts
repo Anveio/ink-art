@@ -1,4 +1,4 @@
-import { type BBox, type Pt, bboxOf, bboxUnion, catmullRom, clamp, dist, ellipsePts, lineCrossings, quad, resample, smoothstep } from '../core/geom.ts';
+import { type BBox, type Pt, bboxIntersects, bboxOf, bboxUnion, catmullRom, clamp, dist, ellipsePts, lineCrossings, pointInPoly, quad, resample, smoothstep } from '../core/geom.ts';
 import { fbm1, rng, seedOf } from '../core/random.ts';
 import { type Pencil, type PencilName, pencil as getPencil } from './pencils.ts';
 import { PAPERS, type Paper, type PaperName } from './paper.ts';
@@ -55,6 +55,8 @@ export interface StrokeOpts {
   dent?: number;
   /** Tip radius growth in mm per 100 mm drawn (the lead dulls). Call pen.sharpen() to reset. */
   wear?: number;
+  /** Pressure multiplier by page position (mm). Lets one stroke follow a tonal map. */
+  field?: (x: number, y: number) => number;
   seed?: number | string;
 }
 
@@ -83,6 +85,8 @@ export interface ToneOpts extends HatchOpts {
 export interface ToolOpts {
   radius?: number;
   amount?: number;
+  /** Strength multiplier by page position (mm), e.g. to lift highlights from a tonal map. */
+  field?: (x: number, y: number) => number;
   seed?: number | string;
 }
 
@@ -152,8 +156,49 @@ export class Page {
     }
   }
 
+  private occluders: { poly: Pt[]; box: BBox }[] = [];
+
+  /**
+   * Draw `fn` behind the given shapes (page mm polygons): strokes stop where they pass behind
+   * one, like a careful artist lifting the pencil at a foreground silhouette.
+   */
+  behind<T>(polys: Pt[][], fn: () => T): T {
+    const add = polys.map((poly) => ({ poly, box: bboxOf(poly.flat(), 2) }));
+    this.occluders.push(...add);
+    try {
+      return fn();
+    } finally {
+      this.occluders.splice(this.occluders.length - add.length, add.length);
+    }
+  }
+
+  private clips: { poly: Pt[]; box: BBox }[] = [];
+
+  /** Draw `fn` inside a shape only (a panel frame): strokes stop at its edge. */
+  within<T>(poly: Pt[], fn: () => T): T {
+    this.clips.push({ poly, box: bboxOf(poly.flat(), 2) });
+    const done = () => this.clips.pop();
+    try {
+      const out = fn();
+      if (out instanceof Promise) return out.finally(done) as T;
+      done();
+      return out;
+    } catch (e) {
+      done();
+      throw e;
+    }
+  }
+
   /** @internal */
   push(op: Op) {
+    if (op.kind === 'stroke' && (this.occluders.length || this.clips.length)) {
+      for (const part of splitHidden(op, this.occluders, this.clips)) this.pushRaw(part);
+      return;
+    }
+    this.pushRaw(op);
+  }
+
+  private pushRaw(op: Op) {
     op.group = this.currentGroup;
     this.ops.push(op);
     const i = this.ops.length - 1;
@@ -378,7 +423,8 @@ export class Pen {
 
   /** Smudge with a blending stump over a polygon: softens tooth texture and adds burnish. */
   blend(area: Pt[], opts: ToolOpts = {}): this {
-    return this.tool('blend', zigzag(area, (opts.radius ?? 1.5) * 1.2), opts);
+    // Rows overlap so the stump's pressure is even across the area (no striping).
+    return this.tool('blend', zigzag(area, (opts.radius ?? 1.5) * 0.6), opts);
   }
 
   /** Blend along a path rather than over an area. */
@@ -393,7 +439,7 @@ export class Pen {
 
   /** Erase an area. */
   eraseArea(area: Pt[], opts: ToolOpts = {}): this {
-    return this.tool('erase', zigzag(area, (opts.radius ?? 1.5) * 1.1), opts);
+    return this.tool('erase', zigzag(area, (opts.radius ?? 1.5) * 0.6), opts);
   }
 
   /** Comic speech bubble outline with a tail pointing at `tail`. Lettering comes later. */
@@ -411,7 +457,7 @@ export class Pen {
     const step = kind === 'smudge' ? Math.max(0.08, radius * 0.12) : Math.max(0.05, radius * 0.25);
     const { pts } = resample(path, step);
     const data = new Float32Array(pts.length * 4);
-    pts.forEach((p, i) => data.set([p[0], p[1], 1, radius], i * 4));
+    pts.forEach((p, i) => data.set([p[0], p[1], opts.field ? clamp(opts.field(p[0], p[1])) : 1, radius], i * 4));
     const op = toolOp(kind, data, clamp(opts.amount ?? 0.7), radius);
     if (eraser) op.eraser = eraser;
     this.page.push(op);
@@ -419,11 +465,36 @@ export class Pen {
   }
 }
 
+/** Split a stroke into the runs of vertices that are not inside any occluder. */
+function splitHidden(op: StrokeOp, occ: { poly: Pt[]; box: BBox }[], clips: { poly: Pt[]; box: BBox }[] = []): StrokeOp[] {
+  const d = op.data, n = d.length / 4;
+  const hits = occ.filter((o) => bboxIntersects(o.box, op.bbox));
+  const inBox = (pt: Pt, b: BBox) => pt[0] >= b[0] && pt[0] <= b[2] && pt[1] >= b[1] && pt[1] <= b[3];
+  if (!hits.length && !clips.length) return [op];
+  const out: StrokeOp[] = [];
+  let start = -1;
+  const flush = (end: number) => {
+    if (start >= 0 && end - start >= 2) {
+      const data = d.slice(start * 4, end * 4);
+      out.push({ ...op, data, bbox: bboxOf(data, 4, op.pencil.tip * 2) });
+    }
+    start = -1;
+  };
+  for (let i = 0; i < n; i++) {
+    const pt: Pt = [d[i * 4], d[i * 4 + 1]];
+    const hidden = hits.some((o) => inBox(pt, o.box) && pointInPoly(pt, o.poly)) || clips.some((c) => !inBox(pt, c.box) || !pointInPoly(pt, c.poly));
+    if (hidden) flush(i);
+    else if (start < 0) start = i;
+  }
+  flush(n);
+  return out;
+}
+
 function toolOp(kind: ToolKind, data: Float32Array, amount: number, radius: number): ToolOp {
   // Tool ops store radius per vertex; a stroke's data is reused for dents with a narrow radius.
   const d = new Float32Array(data);
   for (let i = 3; i < d.length; i += 4) d[i] = radius;
-  for (let i = 2; i < d.length; i += 4) d[i] = kind === 'indent' ? Math.min(1, data[i] * 1.2) : 1;
+  for (let i = 2; i < d.length; i += 4) d[i] = kind === 'indent' ? Math.min(1, data[i] * 1.2) : data[i];
   return { kind, data: d, amount, bbox: bboxOf(d, 4, radius * 2), group: '' };
 }
 
@@ -485,7 +556,8 @@ function buildStroke(points: Pt[], o: StrokeOpts, seed: number, pressureScale: n
     // Taper envelope: ease the pressure on/off at the ends, scaled down for short strokes.
     const k = Math.min(1, len / Math.max(0.01, tin + tout));
     const env = smoothstep(0, Math.max(0.01, tin * k), s) * smoothstep(0, Math.max(0.01, tout * k), len - s);
-    const pr = clamp(pressureAt(press, t) * pressureScale * (0.25 + 0.75 * env) * (1 + fbm1(s / 6, ns + 77, 2) * flutter));
+    const fk = o.field ? Math.max(0, o.field(pts[i][0], pts[i][1])) : 1;
+    const pr = clamp(fk * pressureAt(press, t) * pressureScale * (0.25 + 0.75 * env) * (1 + fbm1(s / 6, ns + 77, 2) * flutter));
     data[i * 4] = pts[i][0] + nx * off;
     data[i * 4 + 1] = pts[i][1] + ny * off;
     data[i * 4 + 2] = pr * (0.35 + 0.65 * env);

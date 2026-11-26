@@ -58,6 +58,34 @@ Stroke options: `pencil` (4H..8B), `pressure` (number, [start,end] or fn), `widt
 Render options: `dpi` or `fit`, `region`, `finish` (`flat` | `scan` | `photo`), `at`, `only`,
 `hide`, `grid`, `sheen`, `light`.
 
+## Lettering, rigs and occlusion
+
+```ts
+import { balloon, letter, Rig } from '../src/index.ts';
+letter(pen, 'THE MISSING TILE', [8, 12], { size: 4.6, align: 'left' }); // single-stroke hand lettering
+balloon(pen, "HOLD ON...\nI'M ONE TILE SHORT.", [40, 30], [60, 50]); // sized to its text, stubby tail
+const head = new Rig([60, 80], 1.9);         // draw a character in its own units, placed/scaled on the page
+head.stroke(pen, [[-9, 0], [0, 12], [9, 0]]);
+p.behind([silhouette], () => ...);           // strokes stop behind a foreground shape
+p.within(panelRect, () => ...);              // strokes stop at the panel frame
+```
+
+## Studio rendering (photoreal graphite)
+
+High-fidelity panels are drawn from a lit 3D reference, the way a realist works from a photo:
+
+1. Model the subject as a signed distance field (`src/studio/sdf.ts`: primitives, soft shadows,
+   AO, one reflection bounce, `depthOfField`). `cachedSdf` in `src/studio/sdf-node.ts` renders it on
+   every core and caches it in `out/cache` (see `scenes/comic-01/still-life.ts`).
+2. Turn luminance into a darkness target (`darknessOf`, 0 = paper, 1 = darkest graphite).
+3. `toneMap(page, target, opts)` draws it with real strokes: 2H to 8B hatching layers at different
+   angles (pressure follows the map, the pencil lifts at object edges), stump blending kept off the
+   edges, an optional `polish` pass for light passages, then a look at the drawing and a correction
+   layer. A measured response curve for the paper and layer stack pre-distorts the target, so the
+   first pass lands within a couple of percent. `mask` keeps areas (speech balloons) paper-white.
+
+Render with `--ss 2` (or 3) to supersample: fine hatching averages into tone instead of moire.
+
 ## History
 
 The op list is the history: small, exact and diffable in git. `at` renders the drawing as it

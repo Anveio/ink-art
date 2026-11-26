@@ -51,7 +51,7 @@ async function main() {
   const { pos, flags } = parseArgs(process.argv.slice(2));
   const [cmd, file] = pos;
   if (!cmd || !file) {
-    console.log('usage: ink render|info|history|diff <scene.ts> [--dpi N] [--fit PX] [--region x,y,w,h] [--group NAME] [--only a,b] [--hide a,b] [--finish flat|scan|photo] [--grid MM] [--sheen K] [--at POS] [--frames N | --marks] [--from POS --to POS] [--out FILE]');
+    console.log('usage: ink render|info|history|diff <scene.ts> [--dpi N] [--fit PX] [--region x,y,w,h] [--group NAME] [--only a,b] [--hide a,b] [--finish flat|scan|photo] [--grid MM] [--sheen K] [--at POS] [--frames N | --marks] [--from POS --to POS] [--ss N] [--out FILE]');
     process.exit(1);
   }
   const page = await loadScene(file);
@@ -107,7 +107,7 @@ async function main() {
     return;
   }
   const out = flags.out ?? `out/${base}${flags.group ? '.' + flags.group.replace(/\//g, '_') : ''}${flags.region ? '.crop' : ''}.png`;
-  console.log(renderToFile(page, out, opts));
+  console.log(renderToFile(page, out, { ...opts, supersample: flags.ss ? Number(flags.ss) : undefined }));
 }
 
 main().catch((e) => {

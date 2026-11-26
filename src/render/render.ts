@@ -240,7 +240,8 @@ function depositStroke(op: StrokeOp, b: Buf, c: Ctx) {
       let massK = 1;
       if (r < 0.75) { massK = (r / 0.75) ** 2; r = 0.75; }
       const aa = Math.max(0.6, r * 0.08);
-      const reach = Math.min(1, pen.reach * Math.pow(pr, 0.45));
+      // Firm pressure pushes the lead down into the valleys too, so heavy lines go solid.
+      const reach = Math.min(1, pen.reach * Math.pow(pr, 0.45) + 0.4 * pr * pr * pr);
       const th = 1 - reach;
       const amount = pen.rate * pr * (sp / (2 * r)) * massK * 2.2;
       const R = r + aa;
@@ -450,8 +451,8 @@ function shade(b: Buf, c: Ctx, m: number, w: number, h: number, out: Uint8Clampe
       hx *= hl; hy *= hl; hz *= hl;
       const ndh = Math.max(0, nx * hx + ny * hy + nz * hz);
       // Burnished tooth peaks shine most.
-      const shine = (1 - Math.exp(-S[idx] * 0.5)) * a * (0.35 + 1.3 * H[idx]);
-      const gloss = finish === 'photo' ? 0.1 * Math.pow(ndh, 10) + 0.35 * Math.pow(ndh, 60) + 0.7 * Math.pow(ndh, 300) : 0.05 * Math.pow(ndh, 6) + 0.2 * Math.pow(ndh, 60);
+      const shine = (1 - Math.exp(-S[idx] * 0.5)) * a * (0.2 + 1.0 * H[idx]);
+      const gloss = finish === 'photo' ? 0.05 * Math.pow(ndh, 10) + 0.25 * Math.pow(ndh, 60) + 0.7 * Math.pow(ndh, 300) : 0.015 * Math.pow(ndh, 6) + 0.2 * Math.pow(ndh, 60);
       const spec = shine * gloss * c.sheen * irr;
       // Paper itself has a faint matte sheen.
       const pspec = (1 - a) * 0.03 * Math.pow(ndh, 4) * irr;
