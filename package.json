@@ -1,0 +1,23 @@
+{
+  "name": "ink-art",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "ink": "tsx src/node/cli.ts",
+    "typecheck": "tsc"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^26.6.11",
+    "@types/pngjs": "^6.0.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "pngjs": "^7.0.0"
+  },
+  "type": "module",
+  "private": true
+}
