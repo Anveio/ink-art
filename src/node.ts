@@ -2,6 +2,9 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { PNG } from 'pngjs';
+import { deflateRawSync, inflateRawSync } from 'node:zlib';
+import type { RasterSnapshot } from './render/render.ts';
+import type { SnapshotCodec } from './render/timeline.ts';
 import { render, type RenderOpts, type RenderedImage } from './render/render.ts';
 import type { Page } from './sdk/page.ts';
 
@@ -42,4 +45,56 @@ function crc32(b: Buffer): number {
     for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
   }
   return ~c;
+}
+
+/**
+ * Keyframe codec for timelines: graphite buffers are mostly empty or smooth, so plain deflate of
+ * the float data compresses them hard. Paper height is only stored once something dented it.
+ */
+export const zlibCodec: SnapshotCodec = {
+  pack(s, hasOwnH) {
+    // Quantise to 16 bits (graphite in 1/2048ths, tone as a ratio, height offset), then split
+    // high and low bytes into separate planes so deflate sees long runs. Visually lossless.
+    const n = s.D.length, planes = hasOwnH ? 4 : 3;
+    const q = new Uint16Array(n * planes);
+    for (let i = 0; i < n; i++) {
+      const d = s.D[i];
+      q[i] = Math.min(65535, Math.round(d * 2048));
+      q[n + i] = d > 1e-6 ? Math.min(65535, Math.round((s.T[i] / d) * 65535)) : 0;
+      q[2 * n + i] = Math.min(65535, Math.round(s.S[i] * 2048));
+      if (hasOwnH) q[3 * n + i] = Math.round((s.H[i] + 1) * 21845);
+    }
+    const bytes = new Uint8Array(q.length * 2);
+    for (let i = 0; i < q.length; i++) { bytes[i] = q[i] >>> 8; bytes[q.length + i] = q[i] & 255; }
+    const z = deflateRawSync(bytes, { level: 6 });
+    const out = new Uint8Array(z.byteLength + 9);
+    const dv = new DataView(out.buffer);
+    dv.setUint32(0, n); dv.setUint32(4, s.hVersion); out[8] = planes;
+    out.set(z, 9);
+    return out;
+  },
+  unpack(p, baseH): RasterSnapshot {
+    const u = p as Uint8Array;
+    const dv = new DataView(u.buffer, u.byteOffset, u.byteLength);
+    const n = dv.getUint32(0), hVersion = dv.getUint32(4), planes = u[8];
+    const bytes = inflateRawSync(u.subarray(9));
+    const L = n * planes;
+    const D = new Float32Array(n), T = new Float32Array(n), S = new Float32Array(n);
+    const H = planes === 4 ? new Float32Array(n) : baseH;
+    const v = (k: number) => (bytes[k] << 8) | bytes[L + k];
+    for (let i = 0; i < n; i++) {
+      D[i] = v(i) / 2048;
+      T[i] = D[i] * (v(n + i) / 65535);
+      S[i] = v(2 * n + i) / 2048;
+      if (planes === 4) H[i] = v(3 * n + i) / 21845 - 1;
+    }
+    return { D, T, S, H, hVersion };
+  },
+};
+
+/** Write any RenderedImage-like (strips, diffs) to PNG. */
+export function writeImage(img: RenderedImage, file: string): string {
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, encodePng(img));
+  return `${file} ${img.width}x${img.height}px`;
 }

@@ -13,8 +13,12 @@ export interface StrokeOp {
   bbox: BBox;
   group: string;
 }
+export type ToolKind = 'blend' | 'erase' | 'scrub' | 'indent' | 'dab' | 'smudge';
+export type EraserKind = 'kneaded' | 'rubber' | 'vinyl';
 export interface ToolOp {
-  kind: 'blend' | 'erase';
+  kind: ToolKind;
+  /** For scrub: which eraser. */
+  eraser?: EraserKind;
   /** Packed vertices: x, y, strength (0..1), radius (mm). */
   data: Float32Array;
   amount: number;
@@ -47,6 +51,10 @@ export interface StrokeOpts {
   flutter?: number;
   /** Smooth the given points with a spline (true) or keep them as a polyline. */
   smooth?: boolean;
+  /** Also press a groove into the paper along the stroke (hard lead, heavy hand). 0..1. */
+  dent?: number;
+  /** Tip radius growth in mm per 100 mm drawn (the lead dulls). Call pen.sharpen() to reset. */
+  wear?: number;
   seed?: number | string;
 }
 
@@ -78,6 +86,16 @@ export interface ToolOpts {
   seed?: number | string;
 }
 
+export interface ScrubOpts extends ToolOpts {
+  /** Round trips: the eraser goes from -> to -> from this many times. */
+  n?: number;
+  eraser?: EraserKind;
+  /** Sideways drift of the hand between passes, mm. */
+  drift?: number;
+}
+
+export interface Mark { label: string; op: number }
+
 export interface Style extends StrokeOpts {}
 
 /** Named stroke styles. Mix freely per panel; that's the point of the comedy. */
@@ -105,7 +123,9 @@ export class Page {
   readonly paper: Paper;
   readonly seed: number;
   readonly ops: Op[] = [];
+  readonly marks: Mark[] = [];
   private currentGroup = 'main';
+  private groupRanges = new Map<string, [number, number]>();
   private groupBoxes = new Map<string, BBox>();
 
   constructor(opts: PageOpts = {}) {
@@ -136,8 +156,28 @@ export class Page {
   push(op: Op) {
     op.group = this.currentGroup;
     this.ops.push(op);
+    const i = this.ops.length - 1;
+    const gr = this.groupRanges.get(op.group);
+    this.groupRanges.set(op.group, gr ? [gr[0], i] : [i, i]);
     const b = this.groupBoxes.get(op.group);
     this.groupBoxes.set(op.group, b ? bboxUnion(b, op.bbox) : op.bbox);
+  }
+
+  /** Name the current point in the drawing's history (e.g. 'linework done'). */
+  mark(label: string): this {
+    this.marks.push({ label, op: this.ops.length });
+    return this;
+  }
+
+  /** Resolve a history position: a mark label, an op count, or a group name (= the state after it). */
+  at(pos: string | number): number {
+    if (typeof pos === 'number') return Math.max(0, Math.min(this.ops.length, pos));
+    const m = this.marks.find((k) => k.label === pos);
+    if (m) return m.op;
+    const r = this.groupRanges.get(pos);
+    if (r) return r[1] + 1;
+    if (/^\d+$/.test(pos)) return this.at(Number(pos));
+    throw new Error(`unknown history position "${pos}". Marks: ${this.marks.map((k) => k.label).join(', ') || 'none'}`);
   }
 
   /** @internal Monotonic per-page seed stream so every op is unique but reproducible. */
@@ -153,7 +193,8 @@ export class Page {
       size: [this.width, this.height],
       paper: this.paper.name,
       ops: this.ops.length,
-      groups: [...this.groupBoxes].map(([name, b]) => ({ name, ops: counts.get(name) ?? 0, bbox: b.map((v) => Math.round(v * 10) / 10) })),
+      groups: [...this.groupBoxes].map(([name, b]) => ({ name, ops: counts.get(name) ?? 0, range: this.groupRanges.get(name), bbox: b.map((v) => Math.round(v * 10) / 10) })),
+      marks: this.marks,
     };
   }
 
@@ -167,7 +208,15 @@ export class Page {
 const pressureAt = (p: Pressure, t: number) => (typeof p === 'number' ? p : typeof p === 'function' ? p(t) : p[0] + (p[1] - p[0]) * t);
 
 export class Pen {
+  /** mm of line drawn since the last sharpen (for `wear`). */
+  drawn = 0;
   constructor(readonly page: Page, readonly defaults: StrokeOpts) {}
+
+  /** Fresh point on the lead. */
+  sharpen(): this {
+    this.drawn = 0;
+    return this;
+  }
 
   /** A pen with some defaults changed. */
   with(opts: StrokeOpts): Pen {
@@ -188,9 +237,63 @@ export class Pen {
         const dx = (r() - 0.5) * 2 * s, dy = (r() - 0.5) * 2 * s;
         pts = points.map(([x, y]) => [x + dx, y + dy]);
       }
-      this.page.push(buildStroke(pts, o, baseSeed + k * 7919, k > 0 ? 0.8 : 1));
+      const wearK = o.wear ? Math.min(2.5, 1 + (this.drawn / 100) * (o.wear / pencilTip(o))) : 1;
+      const op = buildStroke(pts, { ...o, width: (o.width ?? 1) * wearK }, baseSeed + k * 7919, k > 0 ? 0.8 : 1);
+      this.page.push(op);
+      this.drawn += strokeLength(op);
+      if (o.dent) this.page.push(toolOp('indent', op.data, Math.min(1, o.dent), 0.12));
     }
     return this;
+  }
+
+  /**
+   * Rub an eraser back and forth between two points, `n` round trips. Each pass lifts less than
+   * the one before; rubber erasers smear a grey haze and rough up the paper so it takes later
+   * graphite unevenly.
+   */
+  scrub(from: Pt, to: Pt, opts: ScrubOpts = {}): this {
+    const r = rng(opts.seed !== undefined ? seedOf(opts.seed) : this.page.nextSeed());
+    const n = Math.max(1, Math.round(opts.n ?? 5));
+    const radius = opts.radius ?? 2.2, drift = opts.drift ?? radius * 0.35;
+    const len = dist(from, to) || 1;
+    const nx = -(to[1] - from[1]) / len, ny = (to[0] - from[0]) / len;
+    for (let k = 0; k < n * 2; k++) {
+      const off = (r() - 0.5) * 2 * drift;
+      // Strokes fall a little short or long at the turnarounds.
+      const a: Pt = [from[0] + nx * off, from[1] + ny * off], b: Pt = [to[0] + nx * off, to[1] + ny * off];
+      const t0 = (r() - 0.5) * 0.15, t1 = 1 + (r() - 0.5) * 0.15;
+      const p0: Pt = [a[0] + (b[0] - a[0]) * t0, a[1] + (b[1] - a[1]) * t0];
+      const p1: Pt = [a[0] + (b[0] - a[0]) * t1, a[1] + (b[1] - a[1]) * t1];
+      const path = k % 2 ? [p1, p0] : [p0, p1];
+      this.tool('scrub', path, { ...opts, radius }, opts.eraser ?? 'rubber');
+    }
+    return this;
+  }
+
+  /** Scrub a whole area: zigzag over it `n` times (alternating direction). */
+  scrubArea(area: Pt[], opts: ScrubOpts = {}): this {
+    const n = Math.max(1, Math.round(opts.n ?? 2));
+    const radius = opts.radius ?? 2.2;
+    for (let k = 0; k < n; k++) {
+      const z = zigzag(area, radius * 1.3);
+      this.tool('scrub', k % 2 ? z.reverse() : z, { ...opts, radius }, opts.eraser ?? 'rubber');
+    }
+    return this;
+  }
+
+  /** Press a groove into the paper (stylus, fingernail). Shade over it later and it stays white. */
+  indent(path: Pt[], opts: ToolOpts = {}): this {
+    return this.tool('indent', path.length > 2 ? catmullRom(path, 0.1) : path, { radius: 0.15, amount: 0.8, ...opts });
+  }
+
+  /** Press a kneaded eraser straight down: soft, mottled lift with no rubbing. */
+  dab(at: Pt, opts: ToolOpts = {}): this {
+    return this.tool('dab', [at, [at[0] + 0.01, at[1]]], { radius: 2, amount: 0.6, ...opts });
+  }
+
+  /** Drag a fingertip along a path: graphite is pulled in the direction of travel. */
+  smudge(path: Pt[], opts: ToolOpts = {}): this {
+    return this.tool('smudge', path.length > 2 ? catmullRom(path, 0.2) : path, { radius: 2.5, amount: 0.6, ...opts });
   }
 
   line(a: Pt, b: Pt, opts: StrokeOpts = {}): this {
@@ -303,15 +406,34 @@ export class Pen {
     return this.stroke(pts, { smooth: false, passes: 1, overshoot: 0, ...opts });
   }
 
-  private tool(kind: 'blend' | 'erase', path: Pt[], opts: ToolOpts): this {
+  private tool(kind: ToolKind, path: Pt[], opts: ToolOpts, eraser?: EraserKind): this {
     const radius = opts.radius ?? 1.5;
-    const { pts } = resample(path, Math.max(0.15, radius * 0.25));
+    const step = kind === 'smudge' ? Math.max(0.08, radius * 0.12) : Math.max(0.05, radius * 0.25);
+    const { pts } = resample(path, step);
     const data = new Float32Array(pts.length * 4);
     pts.forEach((p, i) => data.set([p[0], p[1], 1, radius], i * 4));
-    this.page.push({ kind, data, amount: clamp(opts.amount ?? 0.7), bbox: bboxOf(data, 4, radius * 2), group: '' });
+    const op = toolOp(kind, data, clamp(opts.amount ?? 0.7), radius);
+    if (eraser) op.eraser = eraser;
+    this.page.push(op);
     return this;
   }
 }
+
+function toolOp(kind: ToolKind, data: Float32Array, amount: number, radius: number): ToolOp {
+  // Tool ops store radius per vertex; a stroke's data is reused for dents with a narrow radius.
+  const d = new Float32Array(data);
+  for (let i = 3; i < d.length; i += 4) d[i] = radius;
+  for (let i = 2; i < d.length; i += 4) d[i] = kind === 'indent' ? Math.min(1, data[i] * 1.2) : 1;
+  return { kind, data: d, amount, bbox: bboxOf(d, 4, radius * 2), group: '' };
+}
+
+function strokeLength(op: StrokeOp): number {
+  let l = 0;
+  for (let i = 4; i < op.data.length; i += 4) l += Math.hypot(op.data[i] - op.data[i - 4], op.data[i + 1] - op.data[i - 3]);
+  return l;
+}
+
+const pencilTip = (o: StrokeOpts) => getPencil(o.pencil ?? 'HB').tip;
 
 /** Back-and-forth path that covers a polygon (for stump and eraser fills). */
 function zigzag(poly: Pt[], step: number): Pt[] {

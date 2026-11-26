@@ -6,14 +6,19 @@
 //   npm run ink -- render scenes/demo.ts --region 40,60,30,20 --dpi 1200   zoom a 30x20 mm crop
 //   npm run ink -- render scenes/demo.ts --group face --dpi 600            crop to a group
 //   npm run ink -- render scenes/demo.ts --dpi 600 --finish photo --out out/final.png
-//   npm run ink -- info scenes/demo.ts                          groups and bboxes as JSON
+//   npm run ink -- info scenes/demo.ts                          groups, op ranges, marks as JSON
+//   npm run ink -- render scenes/demo.ts --at linework          the drawing as it was at a mark
+//   npm run ink -- history scenes/demo.ts --group face --frames 6     contact strip of the history
+//   npm run ink -- history scenes/demo.ts --marks --fit 300           one frame per mark
+//   npm run ink -- diff scenes/demo.ts --from linework --to shading   what changed, in red
 //
 // A scene file default-exports either a Page, or a function (page) => void and optionally
 // `export const page = { width, height, paper, seed }`.
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Page, type PageOpts } from '../sdk/page.ts';
-import { renderToFile } from '../node.ts';
+import { renderToFile, writeImage, zlibCodec } from '../node.ts';
+import { Timeline, contactStrip, diffImages } from '../render/timeline.ts';
 import type { Finish, RenderOpts } from '../render/render.ts';
 
 export async function loadScene(file: string): Promise<Page> {
@@ -46,7 +51,7 @@ async function main() {
   const { pos, flags } = parseArgs(process.argv.slice(2));
   const [cmd, file] = pos;
   if (!cmd || !file) {
-    console.log('usage: ink render|info <scene.ts> [--dpi N] [--fit PX] [--region x,y,w,h] [--group NAME] [--only a,b] [--hide a,b] [--finish flat|scan|photo] [--grid MM] [--sheen K] [--out FILE]');
+    console.log('usage: ink render|info|history|diff <scene.ts> [--dpi N] [--fit PX] [--region x,y,w,h] [--group NAME] [--only a,b] [--hide a,b] [--finish flat|scan|photo] [--grid MM] [--sheen K] [--at POS] [--frames N | --marks] [--from POS --to POS] [--out FILE]');
     process.exit(1);
   }
   const page = await loadScene(file);
@@ -60,6 +65,7 @@ async function main() {
     finish: (flags.finish as Finish) ?? 'scan',
     grid: flags.grid ? Number(flags.grid) : undefined,
     sheen: flags.sheen ? Number(flags.sheen) : undefined,
+    at: flags.at,
     only: flags.only?.split(','),
     hide: flags.hide?.split(','),
   };
@@ -74,6 +80,32 @@ async function main() {
     opts.region = [b[0] - pad, b[1] - pad, b[2] - b[0] + pad * 2, b[3] - b[1] + pad * 2];
   }
   const base = file.replace(/^.*\//, '').replace(/\.[tj]s$/, '');
+  if (cmd === 'history' || cmd === 'diff') {
+    if (!opts.dpi && !opts.fit) opts.fit = cmd === 'history' ? 320 : 700;
+    const tl = new Timeline(page, { ...opts, at: undefined, codec: zlibCodec });
+    const t0 = performance.now();
+    if (cmd === 'diff') {
+      const a = tl.at(flags.from ?? 0), b = tl.at(flags.to ?? page.ops.length);
+      const d = diffImages(a, b);
+      const out = flags.out ?? `out/${base}.diff.png`;
+      console.log(`${writeImage(d, out)} changed ${d.changed}px (${((100 * d.changed) / (d.width * d.height)).toFixed(1)}%)`);
+      return;
+    }
+    let positions: (number | string)[];
+    if (flags.marks) positions = page.marks.map((m) => m.label).concat(['end']);
+    else {
+      const n = Math.max(2, Number(flags.frames ?? 6));
+      // Spread frames over the ops that touch this region, not over the whole page.
+      const steps = tl.steps;
+      positions = steps.length ? Array.from({ length: n }, (_, k) => steps[Math.max(0, Math.round(((k + 1) / n) * steps.length) - 1)]) : [page.ops.length];
+    }
+    const frames = positions.map((p) => tl.at(p === 'end' ? page.ops.length : p));
+    const captions = positions.map((p) => (typeof p === 'number' ? `#${p}` : String(p)));
+    const out = flags.out ?? `out/${base}.history.png`;
+    const st = tl.storage;
+    console.log(`${writeImage(contactStrip(frames, captions), out)} ${frames.length} frames ${Math.round(performance.now() - t0)}ms keyframes ${st.keyframes} (${(st.bytes / 1024).toFixed(0)} KiB)`);
+    return;
+  }
   const out = flags.out ?? `out/${base}${flags.group ? '.' + flags.group.replace(/\//g, '_') : ''}${flags.region ? '.crop' : ''}.png`;
   console.log(renderToFile(page, out, opts));
 }

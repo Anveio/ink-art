@@ -38,14 +38,39 @@ export default function (p: Page) {
   pen.blend(poly); pen.blendPath(path);       // blending stump
   pen.erase(path); pen.eraseArea(poly);       // kneaded eraser (lifts peaks first)
   pen.bubble(center, rx, ry, tailTip);        // speech bubble outline
+
+  // Tools that change the paper itself
+  pen.scrub(from, to, { n: 5, eraser: 'rubber' });  // n round trips; rubber smears + roughs the paper
+  pen.scrubArea(poly, { eraser: 'vinyl' });         // erasers: kneaded | rubber | vinyl
+  pen.dab(point, { radius: 3 });              // kneaded eraser pressed straight down
+  pen.smudge(path, { radius: 2.5 });          // fingertip drags graphite along the path
+  pen.indent(path);                           // stylus groove: later shading skips it (white line)
+  pen.stroke(pts, { dent: 0.8 });             // heavy hard-lead stroke that also grooves the paper
+  p.pen({ wear: 0.25 }) ... pen.sharpen();    // lead dulls as you draw; sharpen resets
+
+  p.mark('linework');                         // name a point in the history
 }
 ```
 
 Stroke options: `pencil` (4H..8B), `pressure` (number, [start,end] or fn), `width`, `taper`,
 `wobble`, `tremor`, `overshoot`, `passes`, `spread`, `flutter`, `smooth`, `seed`.
 
-Render options: `dpi` or `fit`, `region`, `finish` (`flat` | `scan` | `photo`), `only`, `hide`,
-`grid`, `sheen`, `light`.
+Render options: `dpi` or `fit`, `region`, `finish` (`flat` | `scan` | `photo`), `at`, `only`,
+`hide`, `grid`, `sheen`, `light`.
+
+## History
+
+The op list is the history: small, exact and diffable in git. `at` renders the drawing as it
+was at a mark, a group (the state just after it) or an op count. `Timeline` scrubs through
+history for one region, keeping keyframes every N ops (16-bit quantised, byte-planed, deflated
+in Node), so a jump replays at most N ops and stepping forward replays only the gap.
+
+```sh
+npm run ink -- render  scenes/doodle-sheet.ts --at lifted
+npm run ink -- history scenes/doodle-sheet.ts --marks --group shocked   # one frame per mark
+npm run ink -- history scenes/eraser-lab.ts --frames 8 --region 0,0,80,50
+npm run ink -- diff    scenes/eraser-lab.ts --from shaded --to erased   # changes in red
+```
 
 From a script: `import { Page, render } from './src/index.ts'` (browser-safe) or
 `import { renderToFile } from './src/node.ts'` (writes PNG with DPI metadata).

@@ -21,6 +21,8 @@ export interface RenderOpts {
   /** Scale the output to fit this many pixels on its long side (overrides dpi). */
   fit?: number;
   finish?: Finish;
+  /** Render the drawing as it was at this point in its history: a mark label, group name or op count. */
+  at?: string | number;
   /** Only draw these groups (prefix match). */
   only?: string[];
   /** Skip these groups (prefix match). */
@@ -50,24 +52,41 @@ const TILE = 384;
 
 export function render(page: Page, opts: RenderOpts = {}): RenderedImage {
   const t0 = performance.now();
-  const region = opts.region ?? [0, 0, page.width, page.height];
-  let dpi = opts.dpi ?? 100;
-  if (opts.fit) dpi = (opts.fit / Math.max(region[2], region[3])) * 25.4;
-  const s = dpi / 25.4; // px per mm
-  const px0 = Math.floor(region[0] * s), py0 = Math.floor(region[1] * s);
-  const W = Math.max(1, Math.ceil((region[0] + region[2]) * s) - px0);
-  const H = Math.max(1, Math.ceil((region[1] + region[3]) * s) - py0);
-  const out = new Uint8ClampedArray(W * H * 4);
+  const { s, px0, py0, W, H } = frameFor(page, opts);
+  return renderOps(page, opts, selectOps(page, opts), s, px0, py0, W, H, t0);
+}
 
-  const ops = page.ops.filter((op) => {
+/** Ops in history order, limited by `at`, `only` and `hide`. */
+export function selectOps(page: Page, opts: RenderOpts): Op[] {
+  const end = opts.at !== undefined ? page.at(opts.at) : page.ops.length;
+  return page.ops.slice(0, end).filter((op) => {
     if (opts.only && !opts.only.some((g) => op.group === g || op.group.startsWith(g + '/'))) return false;
     if (opts.hide && opts.hide.some((g) => op.group === g || op.group.startsWith(g + '/'))) return false;
     return true;
   });
-  // Tool ops need neighbouring pixels; normals need one pixel.
+}
+
+export function marginFor(ops: Op[], s: number): number {
   let maxR = 0;
   for (const op of ops) if (op.kind !== 'stroke') maxR = Math.max(maxR, op.data[3]);
-  const margin = Math.ceil(maxR * s * 1.5) + 3;
+  return Math.ceil(maxR * s * 1.5) + 3;
+}
+
+/** Pixel rect for a render: scale and crop. */
+export function frameFor(page: Page, opts: RenderOpts) {
+  const region = opts.region ?? [0, 0, page.width, page.height];
+  let dpi = opts.dpi ?? 100;
+  if (opts.fit) dpi = (opts.fit / Math.max(region[2], region[3])) * 25.4;
+  const s = dpi / 25.4;
+  const px0 = Math.floor(region[0] * s), py0 = Math.floor(region[1] * s);
+  const W = Math.max(1, Math.ceil((region[0] + region[2]) * s) - px0);
+  const H = Math.max(1, Math.ceil((region[1] + region[3]) * s) - py0);
+  return { s, px0, py0, W, H };
+}
+
+function renderOps(page: Page, opts: RenderOpts, ops: Op[], s: number, px0: number, py0: number, W: number, H: number, t0: number): RenderedImage {
+  const out = new Uint8ClampedArray(W * H * 4);
+  const margin = marginFor(ops, s);
 
   const ctx = makeContext(page, opts, s);
   const tilesX = Math.ceil(W / TILE), tilesY = Math.ceil(H / TILE);
@@ -144,27 +163,58 @@ function paperHeight(x: number, y: number, c: Ctx): number {
 }
 
 function renderTile(c: Ctx, allOps: Op[], x: number, y: number, w: number, h: number, margin: number, out: Uint8ClampedArray, ox: number, oy: number, outW: number): Op[] {
-  const bx = x - margin, by = y - margin, bw = w + margin * 2, bh = h + margin * 2;
-  const n = bw * bh;
-  const s = c.s, pmm = c.pmm;
-  const tileBox: BBox = [bx * pmm, by * pmm, (bx + bw) * pmm, (by + bh) * pmm];
-  const ops = allOps.filter((op) => bboxIntersects(op.bbox, tileBox));
-
-  const Hf = new Float32Array(n);
-  for (let j = 0; j < bh; j++)
-    for (let i = 0; i < bw; i++) Hf[j * bw + i] = paperHeight((bx + i + 0.5) * pmm, (by + j + 0.5) * pmm, c);
-
-  const D = new Float32Array(n); // graphite amount
-  const T = new Float32Array(n); // tone-weighted amount (T/D = average lead tone)
-  const S = new Float32Array(n); // burnish / sheen amount
-  const buf: Buf = { D, T, S, H: Hf, bx, by, bw, bh };
-  for (const op of ops) {
-    if (op.kind === 'stroke') depositStroke(op, buf, c);
-    else applyTool(op, buf, c);
-  }
-  shade(buf, c, margin, w, h, out, ox, oy, outW);
+  const r = new Raster(c, x - margin, y - margin, w + margin * 2, h + margin * 2);
+  const ops = allOps.filter((op) => bboxIntersects(op.bbox, r.box));
+  for (const op of ops) r.apply(op);
+  shade(r, c, margin, w, h, out, ox, oy, outW);
   return ops;
 }
+
+/**
+ * The physical state of a rectangle of paper at one resolution: tooth height H (which tools can
+ * dent or rough up), graphite amount D, tone-weighted amount T, burnish S.
+ */
+export class Raster implements Buf {
+  H: Float32Array; D: Float32Array; T: Float32Array; S: Float32Array;
+  /** Bumped whenever H changes, so snapshots can skip it. */
+  hVersion = 0;
+  readonly box: BBox;
+  constructor(readonly c: Ctx, readonly bx: number, readonly by: number, readonly bw: number, readonly bh: number) {
+    const n = bw * bh, pmm = c.pmm;
+    this.box = [bx * pmm, by * pmm, (bx + bw) * pmm, (by + bh) * pmm];
+    this.H = new Float32Array(n);
+    for (let j = 0; j < bh; j++) for (let i = 0; i < bw; i++) this.H[j * bw + i] = paperHeight((bx + i + 0.5) * pmm, (by + j + 0.5) * pmm, c);
+    this.D = new Float32Array(n); this.T = new Float32Array(n); this.S = new Float32Array(n);
+  }
+  apply(op: Op) {
+    if (!bboxIntersects(op.bbox, this.box)) return;
+    if (op.kind === 'stroke') depositStroke(op, this, this.c);
+    else if (op.kind === 'smudge') applySmudge(op, this, this.c);
+    else {
+      applyTool(op, this, this.c);
+      if (op.kind === 'indent' || op.kind === 'scrub') this.hVersion++;
+    }
+  }
+  snapshot(): RasterSnapshot {
+    return { D: this.D.slice(), T: this.T.slice(), S: this.S.slice(), H: this.H.slice(), hVersion: this.hVersion };
+  }
+  restore(s: RasterSnapshot) {
+    this.D.set(s.D); this.T.set(s.T); this.S.set(s.S); this.H.set(s.H); this.hVersion = s.hVersion;
+  }
+  /** Shade the inner area (excluding `margin`) into an RGBA image. */
+  shadeInto(margin: number, out: Uint8ClampedArray) {
+    const w = this.bw - margin * 2, h = this.bh - margin * 2;
+    shade(this, this.c, margin, w, h, out, 0, 0, w);
+  }
+}
+
+export interface RasterSnapshot { D: Float32Array; T: Float32Array; S: Float32Array; H: Float32Array; hVersion: number }
+
+/** Build a render context; exported for the timeline. */
+export function contextFor(page: Page, opts: RenderOpts, pxPerMm: number) {
+  return makeContext(page, opts, pxPerMm);
+}
+export type RenderContext = Ctx;
 
 interface Buf { D: Float32Array; T: Float32Array; S: Float32Array; H: Float32Array; bx: number; by: number; bw: number; bh: number }
 
@@ -231,6 +281,9 @@ function depositStroke(op: StrokeOp, b: Buf, c: Ctx) {
 }
 
 function applyTool(op: ToolOp, b: Buf, c: Ctx) {
+  if (op.kind === 'scrub') return applyScrub(op, b, c);
+  if (op.kind === 'indent') return applyIndent(op, b, c);
+  if (op.kind === 'dab') return applyDab(op, b, c);
   const { D, T, S, bx, by, bw, bh } = b;
   const buf_H = b.H;
   const s = c.s, d = op.data;
@@ -421,7 +474,7 @@ function norm3(v: number[]) {
 }
 
 /** Overlay a labelled mm grid (blue, so it never reads as part of the drawing). */
-function drawGrid(img: RenderedImage, step: number) {
+export function drawGrid(img: RenderedImage, step: number) {
   const s = img.pxPerMm, [ox, oy] = img.origin;
   const blue: [number, number, number] = [40, 110, 230];
   const mix = (i: number, k: number) => {
@@ -447,3 +500,153 @@ function drawGrid(img: RenderedImage, step: number) {
 const fmt = (v: number) => (Math.abs(v - Math.round(v)) < 1e-6 ? String(Math.round(v)) : v.toFixed(1));
 
 export const _internal = { paperHeight, clamp };
+
+/** Per-eraser behaviour: lift per pass, preference for tooth peaks, grey smear, paper abrasion. */
+const ERASERS = {
+  kneaded: { lift: 0.75, peak: 0.75, smear: 0.0, abrade: 0.0 },
+  rubber: { lift: 0.5, peak: 0.45, smear: 0.22, abrade: 0.12 },
+  vinyl: { lift: 0.82, peak: 0.3, smear: 0.06, abrade: 0.07 },
+};
+
+/** Stable per-pixel hash for paper damage, keyed on page position so crops agree. */
+const pxHash = (x: number, y: number, seed: number) => {
+  let h = (Math.imul(x | 0, 73856093) ^ Math.imul(y | 0, 19349663) ^ seed) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+};
+
+function toolMask(op: ToolOp, b: Buf, c: Ctx) {
+  const { bx, by, bw, bh } = b;
+  const s = c.s, d = op.data;
+  const x0 = Math.max(0, Math.floor(op.bbox[0] * s - bx)), x1 = Math.min(bw - 1, Math.ceil(op.bbox[2] * s - bx));
+  const y0 = Math.max(0, Math.floor(op.bbox[1] * s - by)), y1 = Math.min(bh - 1, Math.ceil(op.bbox[3] * s - by));
+  if (x0 > x1 || y0 > y1) return null;
+  const mw = x1 - x0 + 1, mh = y1 - y0 + 1;
+  const M = new Float32Array(mw * mh);
+  for (let v = 0; v < d.length / 4; v++) {
+    const cx = d[v * 4] * s - bx, cy = d[v * 4 + 1] * s - by, r = Math.max(1, d[v * 4 + 3] * s), st = d[v * 4 + 2];
+    const ia = Math.max(x0, Math.floor(cx - r)), ib = Math.min(x1, Math.ceil(cx + r));
+    const ja = Math.max(y0, Math.floor(cy - r)), jb = Math.min(y1, Math.ceil(cy + r));
+    for (let j = ja; j <= jb; j++)
+      for (let i = ia; i <= ib; i++) {
+        const q = Math.hypot(i + 0.5 - cx, j + 0.5 - cy) / r;
+        if (q >= 1) continue;
+        // Erasers have a flatter contact patch than a stump.
+        const k = Math.min(1, (1 - q * q) * 1.6) * st;
+        const m = (j - y0) * mw + (i - x0);
+        if (k > M[m]) M[m] = k;
+      }
+  }
+  return { M, x0, y0, mw, mh };
+}
+
+/** One back-and-forth pass of a real eraser: lifts, smears a grey haze, roughs up the paper. */
+function applyScrub(op: ToolOp, b: Buf, c: Ctx) {
+  const mk = toolMask(op, b, c);
+  if (!mk) return;
+  const { M, x0, y0, mw, mh } = mk;
+  const { D, T, S, H, bx, by, bw, bh } = b;
+  const e = ERASERS[op.eraser ?? 'rubber'];
+  const L = new Float32Array(mw * mh), LT = new Float32Array(mw * mh);
+  for (let j = 0; j < mh; j++)
+    for (let i = 0; i < mw; i++) {
+      const m = M[j * mw + i] * op.amount;
+      if (!m) continue;
+      const idx = (j + y0) * bw + (i + x0);
+      const d0 = D[idx];
+      if (d0 > 0) {
+        const a0 = 1 - Math.exp(-d0 * 1.1);
+        const k = Math.min(1, m * e.lift * (1 - e.peak + e.peak * 1.5 * H[idx]));
+        const a1 = a0 * (1 - k);
+        const d1 = -Math.log(1 - a1) / 1.1;
+        const f = d1 / d0;
+        L[j * mw + i] = d0 - d1;
+        LT[j * mw + i] = T[idx] * (1 - f);
+        D[idx] = d1; T[idx] *= f; S[idx] *= f * 0.7;
+      }
+      if (e.abrade) {
+        // Raised fibres: the scrubbed patch gets rougher and takes graphite unevenly afterwards.
+        const n = pxHash(bx + i + x0, by + j + y0, c.seed) - 0.5;
+        H[idx] = Math.max(0, Math.min(1, H[idx] + m * e.abrade * (n * 1.6 + 0.12)));
+      }
+    }
+  if (!e.smear) return;
+  const r = Math.max(1, Math.round(op.data[3] * c.s * 0.6));
+  const Lb = boxBlur2(L, mw, mh, 0, 0, mw, mh, r), LTb = boxBlur2(LT, mw, mh, 0, 0, mw, mh, r);
+  for (let j = 0; j < mh; j++)
+    for (let i = 0; i < mw; i++) {
+      const idx = (j + y0) * bw + (i + x0);
+      D[idx] += Lb[j * mw + i] * e.smear;
+      T[idx] += LTb[j * mw + i] * e.smear;
+    }
+  void bh;
+}
+
+/** Press a stylus or fingernail into the paper: graphite skips the groove afterwards. */
+function applyIndent(op: ToolOp, b: Buf, c: Ctx) {
+  const mk = toolMask(op, b, c);
+  if (!mk) return;
+  const { M, x0, y0, mw, mh } = mk;
+  for (let j = 0; j < mh; j++)
+    for (let i = 0; i < mw; i++) {
+      const m = M[j * mw + i];
+      if (!m) continue;
+      const idx = (j + y0) * b.bw + (i + x0);
+      b.H[idx] = Math.max(-0.6, b.H[idx] - m * op.amount * 0.9);
+    }
+}
+
+/** Kneaded eraser dabbed straight down: lifts evenly with a mottled edge, no rubbing. */
+function applyDab(op: ToolOp, b: Buf, c: Ctx) {
+  const mk = toolMask(op, b, c);
+  if (!mk) return;
+  const { M, x0, y0, mw, mh } = mk;
+  const { D, T, S, bx, by, bw } = b;
+  for (let j = 0; j < mh; j++)
+    for (let i = 0; i < mw; i++) {
+      const m = M[j * mw + i];
+      if (!m) continue;
+      const xm = (bx + i + x0 + 0.5) * c.pmm, ym = (by + j + y0 + 0.5) * c.pmm;
+      const mottle = 0.6 + 0.8 * vnoise2(xm * 2.5, ym * 2.5, c.seed + 300);
+      const f = 1 - Math.min(0.95, m * op.amount * mottle);
+      const idx = (j + y0) * bw + (i + x0);
+      D[idx] *= f; T[idx] *= f; S[idx] *= f;
+    }
+}
+
+/** Finger or tissue smudge: drags graphite along the path, softening as it goes. */
+function applySmudge(op: ToolOp, b: Buf, c: Ctx) {
+  const { D, T, S, bx, by, bw, bh } = b;
+  const s = c.s, d = op.data, n = d.length / 4;
+  const chans = [D, T, S];
+  for (let v = 1; v < n; v++) {
+    const cx = d[v * 4] * s - bx, cy = d[v * 4 + 1] * s - by;
+    const dx = cx - (d[v * 4 - 4] * s - bx), dy = cy - (d[v * 4 - 3] * s - by);
+    const r = Math.max(1, d[v * 4 + 3] * s), st = d[v * 4 + 2] * op.amount;
+    const ia = Math.max(1, Math.floor(cx - r)), ib = Math.min(bw - 2, Math.ceil(cx + r));
+    const ja = Math.max(1, Math.floor(cy - r)), jb = Math.min(bh - 2, Math.ceil(cy + r));
+    if (ia > ib || ja > jb) continue;
+    const w = ib - ia + 1;
+    for (const ch of chans) {
+      // Read from a copy so the stamp drags old values, not ones it just wrote.
+      const src = new Float32Array(w * (jb - ja + 1));
+      for (let j = ja; j <= jb; j++) src.set(ch.subarray(j * bw + ia, j * bw + ib + 1), (j - ja) * w);
+      const sample = (x: number, y: number) => {
+        const xi = Math.round(x), yi = Math.round(y);
+        if (xi >= ia && xi <= ib && yi >= ja && yi <= jb) return src[(yi - ja) * w + (xi - ia)];
+        return ch[Math.min(bh - 1, Math.max(0, yi)) * bw + Math.min(bw - 1, Math.max(0, xi))];
+      };
+      for (let j = ja; j <= jb; j++)
+        for (let i = ia; i <= ib; i++) {
+          const q = Math.hypot(i + 0.5 - cx, j + 0.5 - cy) / r;
+          if (q >= 1) continue;
+          const k = (1 - q * q) * st;
+          const from = sample(i - dx, j - dy);
+          const avg = (sample(i - 1, j) + sample(i + 1, j) + sample(i, j - 1) + sample(i, j + 1)) * 0.25;
+          const idx = j * bw + i;
+          // Drag + soften, and the skin keeps a little graphite (lightens the path).
+          ch[idx] += ((from * 0.55 + avg * 0.45) * (1 - 0.03 * k) - ch[idx]) * Math.min(1, k * 1.4);
+        }
+    }
+  }
+}
