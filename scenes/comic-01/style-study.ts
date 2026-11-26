@@ -5,7 +5,7 @@ import { cartoonPens } from './cast.ts';
 import { border, panel1, panel3 } from './comic.ts';
 import type { Rect } from './layout.ts';
 
-export const page = { width: 497, height: 142, paper: 'bristol', seed: 'comic-01' } as const;
+export const page = { width: 497, height: 142, paper: 'hotpress', seed: 'comic-01' } as const;
 
 export default async function (p: Page) {
   const styles = ['loose', 'clean', 'bold'] as const;

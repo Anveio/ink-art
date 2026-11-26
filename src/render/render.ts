@@ -241,7 +241,7 @@ function depositStroke(op: StrokeOp, b: Buf, c: Ctx) {
       if (r < 0.75) { massK = (r / 0.75) ** 2; r = 0.75; }
       const aa = Math.max(0.6, r * 0.08);
       // Firm pressure pushes the lead down into the valleys too, so heavy lines go solid.
-      const reach = Math.min(1, pen.reach * Math.pow(pr, 0.45) + 0.4 * pr * pr * pr);
+      const reach = Math.min(1, pen.reach * Math.pow(pr, 0.45) + 0.22 * pr * pr * pr);
       const th = 1 - reach;
       const amount = pen.rate * pr * (sp / (2 * r)) * massK * 2.2;
       const R = r + aa;

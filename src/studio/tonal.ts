@@ -10,7 +10,7 @@
 import { type Pt, clamp } from '../core/geom.ts';
 import { rng, seedOf } from '../core/random.ts';
 import type { Page } from '../sdk/page.ts';
-import type { PencilName } from '../sdk/pencils.ts';
+import { type PencilName, pencil } from '../sdk/pencils.ts';
 import { render } from '../render/render.ts';
 
 /** A scalar field sampled on a regular grid in page millimetres. */
@@ -144,17 +144,28 @@ export function toneMap(p: Page, target: Grid, opts: ToneMapOpts = {}) {
   const ids = opts.ids;
   const idAt = ids ? (x: number, y: number) => ids.data[Math.round((y - ids.y0) / ids.cell) * ids.w + Math.round((x - ids.x0) / ids.cell)] ?? -2 : undefined;
   // Distance-to-edge mask for the stump: 0 on id boundaries, 1 a little away from them.
-  let edgeMask: Grid | undefined;
+  let edgeMask: Grid | undefined, idEdge: Grid | undefined;
   if (ids) {
-    const e = ids.map(() => 1);
-    for (let j = 1; j < ids.h - 1; j++)
-      for (let i = 1; i < ids.w - 1; i++) {
-        const k = j * ids.w + i, v = ids.data[k];
-        if (ids.data[k + 1] !== v || ids.data[k - 1] !== v || ids.data[k + ids.w] !== v || ids.data[k - ids.w] !== v) e.data[k] = 0;
-      }
-    edgeMask = e.blur(Math.max(1, Math.round((opts.edgeBand ?? 0.25) / ids.cell))).map((v) => clamp((v - 0.35) * 2.5));
+    idEdge = idEdges(ids);
+    edgeMask = keepOut(idEdge, opts.edgeBand ?? 0.25);
   }
-  const blendMask = mask && edgeMask ? mask.map((v, x, y) => v * edgeMask!.at(x, y)) : mask ?? edgeMask;
+  // Tonal edges inside one object (a groove, a bitten notch) stop the stump as well as id edges.
+  const toneEdge = (band: number) => {
+    const c = target.cell, g = target.map(() => 0);
+    for (let j = 1; j < target.h - 1; j++)
+      for (let i = 1; i < target.w - 1; i++) {
+        const k = j * target.w + i, d = target.data;
+        g.data[k] = Math.hypot(d[k + 1] - d[k - 1], d[k + target.w] - d[k - target.w]) / (2 * c);
+      }
+    // ~0.5 darkness per mm counts as an edge; spread the keep-out over `band` mm.
+    return keepOut(g.map((v) => (v > 0.5 ? 0 : 1)), band);
+  };
+  const tEdge = opts.blend === false && !opts.polish ? undefined : toneEdge(opts.edgeBand ?? 0.25);
+  const mul = (...gs: (Grid | undefined)[]) => {
+    const live = gs.filter(Boolean) as Grid[];
+    return live.length ? live[0].map((v, x, y) => live.slice(1).reduce((a, q) => a * q.at(x, y), v)) : undefined;
+  };
+  const blendMask = mul(mask, edgeMask, tEdge);
   // Feed-forward: measure how this paper and layer stack respond, and pre-distort the target so
   // the first pass already lands close (the look-and-correct rounds then only polish).
   const curve = opts.calibrate === false ? null : responseCurve(p, layers, opts.fineness ?? 1, opts.blend ?? { radius: 0.9, amount: 0.55 });
@@ -164,14 +175,23 @@ export function toneMap(p: Page, target: Grid, opts: ToneMapOpts = {}) {
       const d = pre(target.at(x, y) * m(x, y));
       return clamp((d - L.lo) / (L.hi - L.lo));
     };
-    hatchField(p, region, field, { ...L, spacing: L.spacing * (opts.fineness ?? 1), width: (L.width ?? 0.9) * Math.sqrt(opts.fineness ?? 1), seed: Math.floor(r() * 2 ** 31) }, idAt);
+    hatchField(p, region, field, { ...L, spacing: L.spacing * (opts.fineness ?? 1), width: layerWidth(L, opts.fineness ?? 1), seed: Math.floor(r() * 2 ** 31) }, idAt);
   }
   log(`tone layers: ${p.ops.length} ops, ${Date.now() - t0}ms`);
   const blend = opts.blend ?? { radius: 0.9, amount: 0.55 };
-  if (blend) blendRegion(p, region, blend.radius, blend.amount, blendMask);
+  if (blend) {
+    blendRegion(p, region, blend.radius, blend.amount, blendMask);
+    // A small, sharp stump works right up to the edges so they don't keep a raw hatched rim.
+    const fine = mul(mask, idEdge ? keepOut(idEdge, 0.08) : undefined, toneEdge(0.08));
+    blendRegion(p, region, Math.min(0.3, blend.radius * 0.5), blend.amount * 0.8, fine);
+  }
   if (opts.polish) {
     const pol = opts.polish;
-    const pm = target.map((v, x, y) => clamp((pol.below - v) / Math.max(0.01, pol.below) * 2) * (blendMask ? blendMask.at(x, y) : 1));
+    // Keep the broad stump well clear of edges: it would drag dark detail into the lights.
+    const band = pol.radius * 0.5;
+    const wide = idEdge ? keepOut(idEdge, band) : undefined;
+    const tWide = toneEdge(band);
+    const pm = target.map((v, x, y) => clamp((pol.below - v) / Math.max(0.01, pol.below) * 2) * (wide ? wide.at(x, y) : 1) * tWide.at(x, y) * (mask ? mask.at(x, y) : 1));
     blendRegion(p, region, pol.radius, pol.amount, pm);
   }
 
@@ -200,6 +220,14 @@ export function toneMap(p: Page, target: Grid, opts: ToneMapOpts = {}) {
   log(`tonemap done: ${p.ops.length} ops, ${Date.now() - t0}ms`);
 }
 
+/**
+ * Tonal work is done with a sharp point whatever the grade: soft leads have fat default tips,
+ * which would smear detail, so scale every layer to about a 0.17 mm radius point.
+ */
+function layerWidth(L: ToneLayer, fineness: number) {
+  return (L.width ?? 0.17 / pencil(L.pencil).tip) * Math.sqrt(fineness);
+}
+
 const CURVES = new Map<string, Float32Array>();
 
 /**
@@ -214,7 +242,7 @@ export function responseCurve(p: Page, layers: ToneLayer[], fineness: number, bl
   const scrap = new PageCtor({ width: 140, height: 20, paper: p.paper, seed: 'calibration' });
   const ramp = Grid.over(10, 6, 120, 8, 0.2).fill((x) => clamp((x - 12) / 116));
   const r = rng(7);
-  for (const L of layers) hatchField(scrap, [10, 6, 120, 8], (x, y) => clamp((ramp.at(x, y) - L.lo) / (L.hi - L.lo)), { ...L, spacing: L.spacing * fineness, width: (L.width ?? 0.9) * Math.sqrt(fineness), seed: Math.floor(r() * 2 ** 31) });
+  for (const L of layers) hatchField(scrap, [10, 6, 120, 8], (x, y) => clamp((ramp.at(x, y) - L.lo) / (L.hi - L.lo)), { ...L, spacing: L.spacing * fineness, width: layerWidth(L, fineness), seed: Math.floor(r() * 2 ** 31) });
   if (blend) blendRegion(scrap, [10, 6, 120, 8], blend.radius, blend.amount);
   const seen = look(scrap, [10, 6, 120, 8], 6);
   const out = new Float32Array(64);
@@ -283,6 +311,59 @@ export function blendRegion(p: Page, region: [number, number, number, number], r
   const pen = p.pen('studio');
   const field = mask ? (x: number, y: number) => mask.at(x, y) : undefined;
   pen.blend([[rx, ry], [rx + rw, ry], [rx + rw, ry + rh], [rx, ry + rh]], { radius, amount, field });
+}
+
+/** Ids at or above this are soft: out of focus, they never make an edge for the stump. */
+export const SOFT_ID = 99;
+
+/** Edge map of an id grid: 0 where a cell's neighbour has a different (hard) id, else 1. */
+export function idEdges(ids: Grid): Grid {
+  const e = ids.map(() => 1), d = ids.data, w = ids.w;
+  for (let j = 1; j < ids.h - 1; j++)
+    for (let i = 1; i < w - 1; i++) {
+      const k = j * w + i, v = d[k];
+      if (v >= SOFT_ID) continue;
+      for (const n of [k + 1, k - 1, k + w, k - w]) if (d[n] !== v && d[n] < SOFT_ID) { e.data[k] = 0; break; }
+    }
+  return e;
+}
+
+/**
+ * Keep-out mask from an edge map (0 on edges, 1 elsewhere): 0 within `band` mm of any edge,
+ * easing to 1 by twice that. Uses a chamfer distance transform, so thin edges count fully.
+ */
+export function keepOut(edges: Grid, band: number): Grid {
+  const { w, h } = edges, D = new Float32Array(w * h);
+  for (let k = 0; k < w * h; k++) D[k] = edges.data[k] < 0.5 ? 0 : 1e9;
+  const a = 1, b = Math.SQRT2;
+  for (let j = 0; j < h; j++)
+    for (let i = 0; i < w; i++) {
+      const k = j * w + i;
+      let d = D[k];
+      if (i > 0) d = Math.min(d, D[k - 1] + a);
+      if (j > 0) {
+        d = Math.min(d, D[k - w] + a);
+        if (i > 0) d = Math.min(d, D[k - w - 1] + b);
+        if (i < w - 1) d = Math.min(d, D[k - w + 1] + b);
+      }
+      D[k] = d;
+    }
+  for (let j = h - 1; j >= 0; j--)
+    for (let i = w - 1; i >= 0; i--) {
+      const k = j * w + i;
+      let d = D[k];
+      if (i < w - 1) d = Math.min(d, D[k + 1] + a);
+      if (j < h - 1) {
+        d = Math.min(d, D[k + w] + a);
+        if (i < w - 1) d = Math.min(d, D[k + w + 1] + b);
+        if (i > 0) d = Math.min(d, D[k + w - 1] + b);
+      }
+      D[k] = d;
+    }
+  return new Grid(edges.x0, edges.y0, edges.cell, w, h, D.map((d) => {
+    const t = clamp((d * edges.cell - band) / Math.max(1e-6, band));
+    return t * t * (3 - 2 * t);
+  }));
 }
 
 /** Kneaded eraser in short strokes wherever the field asks for it. */

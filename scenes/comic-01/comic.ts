@@ -1,13 +1,13 @@
 // Comic 01: "The Missing Tile". Three panels: two cartoon sketches, then one ultra-high-fidelity
 // studio graphite rendering for the punchline.
 import { type Page, type Pt, Rig, balloon, letter } from '../../src/index.ts';
-import { darknessOf, Grid, toneMap } from '../../src/studio/tonal.ts';
+import { darknessOf, Grid, SOFT_ID, toneMap } from '../../src/studio/tonal.ts';
 import { PAGE, PANELS, type Rect } from './layout.ts';
 import { PIP_SILHOUETTE, cartoonPens, magsBody, magsHead, magsThinkingHand, pipBody, pipHead, type Pens } from './cast.ts';
 import { CAMERA, stillLifeReference } from './still-life.ts';
 import { depthOfField } from '../../src/studio/sdf.ts';
 
-export const page = { ...PAGE, paper: 'bristol', seed: 'comic-01' } as const;
+export const page = { ...PAGE, paper: 'hotpress', seed: 'comic-01' } as const;
 
 export default async function (p: Page) {
   const skip3 = !!process.env.SKIP_P3;
@@ -18,7 +18,7 @@ export default async function (p: Page) {
   p.group('p1', () => p.within(frame(PANELS[0]), () => panel1(p, P, PANELS[0])));
   p.group('p2', () => p.within(frame(PANELS[1]), () => panel2(p, P, PANELS[1])));
   p.mark('cartoons');
-  if (!skip3) await p.group('p3', () => panel3(p, PANELS[2]));
+  if (!skip3) await p.group('p3', () => panel3(p, PANELS[2], (process.env.P3_STYLE as 'hatched') ?? 'polished'));
 }
 
 function title(p: Page) {
@@ -149,12 +149,12 @@ export async function panel3(p: Page, rect: Rect, style: 'polished' | 'hatched' 
     return Math.min(1, Math.max(0, (q - 1) * 30));
   });
   // Shallow depth of field, focused on the tile's bitten corner, like a macro food shot.
-  const focus = Math.hypot(CAMERA.pos[0] - 2, CAMERA.pos[1] - 12, CAMERA.pos[2] - 12);
-  const shot = depthOfField(ref, focus, 5.5);
+  const focus = Math.hypot(CAMERA.pos[0] + 1, CAMERA.pos[1] - 18, CAMERA.pos[2] - 6);
+  const shot = depthOfField(ref, focus, 2.6);
   // Where it's out of focus there are no hard object edges to respect.
-  const ids = ref.id.map((v, x, y) => (Math.abs(1 - focus / Math.max(1, ref.depth.at(x, y))) * 5.5 > 0.35 ? 99 : v));
+  const ids = ref.id.map((v, x, y) => (Math.abs(1 - focus / Math.max(1, ref.depth.at(x, y))) * 2.6 > 0.35 ? SOFT_ID : v));
   const target = shot.lum.map((l) => darknessOf(l / 1.2));
   const look = style === 'polished' ? { blend: { radius: 0.6, amount: 0.6 }, polish: { radius: 1.2, amount: 0.85, below: 0.5 }, fineness: 0.6 } : { blend: false as const, fineness: 1.3 };
-  p.group('render', () => toneMap(p, target, { ids, mask, highlight: 0.04, ...look, edgeBand: 0.6, lift: false, seed: 'p3', log: process.env.LOG ? console.error : undefined }));
+  p.group('render', () => toneMap(p, target, { ids, mask, highlight: 0.04, ...look, edgeBand: 0.4, lift: false, seed: 'p3', log: process.env.LOG ? console.error : undefined }));
   p.group('balloon', () => balloon(p.pen('clean'), 'IN MY DEFENSE...\nLOOK AT IT.', bc, [x0 - 4, y0 + 22], { size: 2.8, minRx: brx, minRy: bry, maxTail: 4.5, line: { pressure: 0.9 } }));
 }
